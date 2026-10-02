@@ -21,8 +21,15 @@
  */
 
 #include <gst/gst.h>
+#include <gst/app/gstappsrc.h>
 #include <glib/gprintf.h>
 #include <stdlib.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -31,6 +38,7 @@
 static gchar **filenames;
 static gboolean advanced = FALSE;
 static gboolean print_version = FALSE;
+static gboolean stdin_test = FALSE;
 
 static GOptionEntry option_entries[] = {
   {"version", 0, 0, G_OPTION_ARG_NONE, &print_version, "print version information",
@@ -39,6 +47,9 @@ static GOptionEntry option_entries[] = {
     NULL},
   {"basic", 0, G_OPTION_FLAG_REVERSE, G_OPTION_ARG_NONE, &advanced,
     "use basic version (default)", NULL},
+  {"stdin-test", 0, 0, G_OPTION_ARG_NONE, &stdin_test,
+    "read TESTFILE from stdin (raw 48kHz S16LE stereo); TESTFILE may be given as \"-\"",
+    NULL},
   {G_OPTION_REMAINING, 0, 0, G_OPTION_ARG_FILENAME_ARRAY, &filenames, NULL,
    "REFFILE TESTFILE"},
   {NULL, 0, 0, G_OPTION_ARG_NONE, NULL, NULL, NULL}
@@ -81,6 +92,50 @@ static void on_pad_added(GstElement *element, GstPad *pad, gpointer data) {
     gst_object_unref(sinkpad);
 }
 
+/* ---- test 走 stdin（--stdin-test / TESTFILE=="-"）----
+ * GStreamer 的 fdsrc 在 Windows 上对 console/stdin 管道不可用，故用 appsrc：
+ * 调用侧把 test 用 ffmpeg soxr 预转成 raw 48k S16LE stereo 后从 stdin 喂进来，
+ * 省掉一次落盘。caps 与 wavparse 解 48k/s16 wav 出来的完全一致（S16LE 48k 2ch
+ * interleaved），audioconvert/audioresample 在本链路上恒等 —— 数值与「双文件」
+ * 路径逐位等价。stdin 必须在 Windows 上切成二进制模式，否则 0x0A 会被当换行做
+ * CRLF 转换，PCM 直接被破坏。
+ */
+#define STDIN_CHUNK 65536
+static FILE *test_stdin_fp = NULL;
+static gboolean stdin_eos_sent = FALSE;
+
+static void
+cb_need_data (GstElement * appsrc, guint size, gpointer user_data)
+{
+  GstBuffer *buffer;
+  GstMapInfo map;
+  gsize n;
+
+  if (stdin_eos_sent)
+    return;
+
+  buffer = gst_buffer_new_allocate (NULL, STDIN_CHUNK, NULL);
+  gst_buffer_map (buffer, &map, GST_MAP_WRITE);
+  n = fread (map.data, 1, STDIN_CHUNK, test_stdin_fp);
+  gst_buffer_unmap (buffer, &map);
+
+  if (n == 0) {
+    gst_buffer_unref (buffer);
+    stdin_eos_sent = TRUE;
+    gst_app_src_end_of_stream (GST_APP_SRC (appsrc));
+    return;
+  }
+  if (n < STDIN_CHUNK)
+    gst_buffer_set_size (buffer, n);
+  gst_app_src_push_buffer (GST_APP_SRC (appsrc), buffer);
+}
+
+static void
+cb_enough_data (GstElement * appsrc, gpointer user_data)
+{
+  /* appsrc 内部队列已满：停止拉数据，等下一次 need-data 再读 */
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -92,6 +147,7 @@ main(int argc, char *argv[])
              *test_source, *test_decodebin, *test_converter, *test_resample, *peaq;
   gchar *reffilename;
   gchar *testfilename;
+  gboolean test_from_stdin;
 
 #if !GLIB_CHECK_VERSION(2, 32, 0)
   if (!g_thread_supported ())
@@ -141,6 +197,14 @@ main(int argc, char *argv[])
   g_option_context_free (context);
   reffilename = filenames[0];
   testfilename = filenames[1];
+  test_from_stdin = stdin_test || (g_strcmp0 (testfilename, "-") == 0);
+  if (test_from_stdin) {
+#ifdef _WIN32
+    /* stdin 默认文本模式会把 0x0A 当换行做 CRLF 转换，直接毁掉 PCM */
+    _setmode (_fileno (stdin), _O_BINARY);
+#endif
+    test_stdin_fp = stdin;
+  }
 
   loop = g_main_loop_new (NULL, FALSE);
 
@@ -181,12 +245,35 @@ main(int argc, char *argv[])
   }
   g_signal_connect(ref_decodebin, "pad-added", G_CALLBACK(on_pad_added), ref_converter);
 
-  test_source = gst_element_factory_make ("filesrc", "test_file-source");
-  if (!test_source) {
-    puts ("Error: filesrc element could not be instantiated");
-    exit (2);
+  if (test_from_stdin) {
+    GstCaps *caps;
+    test_source = gst_element_factory_make ("appsrc", "test_stdin-source");
+    if (!test_source) {
+      puts ("Error: appsrc element could not be instantiated");
+      exit (2);
+    }
+    /* 与 wavparse 解 48k/s16 wav 后喂给 audioconvert 的 caps 完全一致 */
+    caps = gst_caps_new_simple ("audio/x-raw",
+        "format", G_TYPE_STRING, "S16LE",
+        "layout", G_TYPE_STRING, "interleaved",
+        "rate", G_TYPE_INT, 48000, "channels", G_TYPE_INT, 2, NULL);
+    g_object_set (G_OBJECT (test_source),
+                  "caps", caps,
+                  "stream-type", GST_APP_STREAM_TYPE_STREAM,
+                  "format", GST_FORMAT_TIME,
+                  "do-timestamp", TRUE, NULL);
+    gst_caps_unref (caps);
+    g_signal_connect (test_source, "need-data", G_CALLBACK (cb_need_data), NULL);
+    g_signal_connect (test_source, "enough-data", G_CALLBACK (cb_enough_data), NULL);
+    test_decodebin = NULL;
+  } else {
+    test_source = gst_element_factory_make ("filesrc", "test_file-source");
+    if (!test_source) {
+      puts ("Error: filesrc element could not be instantiated");
+      exit (2);
+    }
+    g_object_set (G_OBJECT (test_source), "location", testfilename, NULL);
   }
-  g_object_set (G_OBJECT (test_source), "location", testfilename, NULL);
   test_converter = gst_element_factory_make ("audioconvert", "test-converter");
   if (!test_converter) {
     puts ("Error: audioconvert element could not be instantiated");
@@ -197,22 +284,28 @@ main(int argc, char *argv[])
     puts ("Error: audioresample element could not be instantiated");
     exit (2);
   }
-  test_decodebin = gst_element_factory_make("decodebin", "test_decodebin");
-  if (!test_decodebin) {
-      puts("Error: decodebin element could not be instantiated");
-      return 2;
+  if (!test_from_stdin) {
+    test_decodebin = gst_element_factory_make("decodebin", "test_decodebin");
+    if (!test_decodebin) {
+        puts("Error: decodebin element could not be instantiated");
+        return 2;
+    }
+    g_signal_connect(test_decodebin, "pad-added", G_CALLBACK(on_pad_added), test_converter);
   }
-  g_signal_connect(test_decodebin, "pad-added", G_CALLBACK(on_pad_added), test_converter);
 
-  gst_bin_add_many (GST_BIN (pipeline), 
+  /* gst_bin_add_many 遇到 NULL 就停止遍历，故 decodebin 必须单独 add */
+  gst_bin_add_many (GST_BIN (pipeline),
                     ref_source, ref_decodebin, ref_converter, ref_resample,
-                    test_source, test_decodebin, test_converter, test_resample,
-                    peaq,
-                    NULL);
+                    test_source, test_converter, test_resample, peaq, NULL);
+  if (!test_from_stdin)
+    gst_bin_add (GST_BIN (pipeline), test_decodebin);
   gst_element_link(ref_source, ref_decodebin);
   gst_element_link (ref_converter, ref_resample);
   gst_element_link_pads (ref_resample, "src", peaq, "ref");
-  gst_element_link(test_source, test_decodebin);
+  if (test_from_stdin)
+    gst_element_link (test_source, test_converter);
+  else
+    gst_element_link(test_source, test_decodebin);
   gst_element_link (test_converter, test_resample);
   gst_element_link_pads (test_resample, "src", peaq, "test");
 
